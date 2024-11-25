@@ -14,31 +14,73 @@ until curl --connect-timeout 1 http://127.0.0.1/; do
     sleep 1s
 done
 echo Nginx has arrived.
-
-echo Waiting for a response from http://${SERVERNAME:-example.com}/
-# --dns-servers 8.8.8.8 (ideal curl flag) is not available in default build
-until curl --connect-timeout 1 http://${SERVERNAME:-example.com}/; do
-    echo Request to http://${SERVERNAME:-example.com}/ failed.  Until Nginx is visible at this DNS, certificate verification cannot succeed.  To avoid hitting rate limits, this check will repeat every 15s until resolved.
-    echo Let\'s Encrypt uses Google\'s DNS servers.  If you have already updated your DNS host, you can flush the Google DNS cache by completing the form at https://developers.google.com/speed/public-dns/cache
-    sleep 15s
-done
-echo Something is responding at  http://${SERVERNAME:-example.com}/
-
 while true; do
 
-    if certbot certonly --non-interactive --webroot -w /usr/share/nginx/html --agree-tos \
-            --rsa-key-size 2048 --keep-until-expiring --expand --register-unsafely-without-email -d $SERVERNAME $EXTRANAMES; then
-        cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/privkey.pem /etc/letsencrypt/privkey-copy.pem
-        cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem /etc/letsencrypt/fullchain-copy.pem
-        nginx -s reload
+if [ "$CERT" = "acme" ]; then 
+    certbot certonly --non-interactive --webroot -w /usr/share/nginx/html --agree-tos \
+        --rsa-key-size 2048 --server "$ACME" --reuse-key --keep-until-expiring --expand --register-unsafely-without-email -d $SERVERNAME $EXTRANAMES
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/privkey.pem /etc/letsencrypt/privkey-copy.pem
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem /etc/letsencrypt/fullchain-copy.pem
+    cat /etc/letsencrypt/live/${SERVERNAME:-example.com}/privkey.pem \
+          /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem \
+          | tee /etc/letsencrypt/live/"$SERVERNAME".pem >/dev/null
+    TLSA=$(openssl x509 -noout -pubkey -in /etc/letsencrypt/live/"$SERVERNAME".pem | openssl rsa -pubin -outform DER 2>/dev/null | sha256sum | sed '' | awk '{print "3 1 1",$1}')
+    echo $TLSA > /etc/letsencrypt/live/"$SERVERNAME"_TLSA.txt
+    echo "Generated below is the TLSA DNS record - Use With Handshake Domains or DNSSEC | Record Name: _443._tcp.$SERVERNAME"
+    echo "TLSA record also stored in: /etc/letsencrypt/live/"$SERVERNAME"_TLSA.txt"
+    echo $TLSA
+    nginx -s reload
+
+elif [ "$CERT" = "self" ]; then
+    mkdir -p /etc/letsencrypt/live/"$SERVERNAME"
+    
+    # Prepare the SAN part (if EXTRANAMES is set)
+    SAN=""
+    if ! [ -z "$EXTRANAMES" ]; then
+        SAN="subjectAltName=DNS:$SERVERNAME $EXTRANAMES"
     else
-        if [ -e /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem ]; then
-            BIGSLEEP="$(( 360 + $(($RANDOM % 360)) ))"m # 6-12 hours
-            sleep $BIGSLEEP
-        fi
+        SAN="subjectAltName=DNS:$SERVERNAME"
     fi
 
-    SMALLSLEEP="$(( 150 + $(($RANDOM % 300)) ))"s # 2.5-7.5 minutes
-    sleep $SMALLSLEEP
+    # Generate a self-signed certificate with SANs
+    openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+    -keyout /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.key -out /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.crt \
+    -extensions ext -config <(echo "[req]";
+        echo distinguished_name=req;
+        echo "[ext]";
+        echo "keyUsage=critical,digitalSignature,keyEncipherment";
+        echo "extendedKeyUsage=serverAuth";
+        echo "basicConstraints=critical,CA:FALSE";
+        echo "$SAN";
+    ) -subj "/CN=$SERVERNAME"
 
-done
+    cat /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.key \
+        /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.crt \
+        | tee /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.pem >/dev/null
+
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.key /etc/letsencrypt/privkey-copy.pem
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.crt /etc/letsencrypt/fullchain-copy.pem
+
+    echo "Self-signed certificate generated and stored in /etc/letsencrypt/"
+    TLSA=$(openssl x509 -noout -pubkey -in /etc/letsencrypt/live/${SERVERNAME:-example.com}/cert.pem | openssl rsa -pubin -outform DER 2>/dev/null | sha256sum | sed '' | awk '{print "3 1 1",$1}')
+    echo $TLSA > /etc/letsencrypt/"$DOMAIN"_TLSA.txt
+    echo "Generated below is the TLSA DNS record - Use With Handshake Domains or DNSSEC | Record Name: _443._tcp.$SERVERNAME"
+    echo $TLSA
+    nginx -s reload
+
+elif [ "$CERT" = "letsencrypt" ]; then
+    certbot certonly --non-interactive --webroot -w /usr/share/nginx/html --agree-tos \
+        --rsa-key-size 2048 --keep-until-expiring --expand --register-unsafely-without-email -d $SERVERNAME $EXTRANAMES
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/privkey.pem /etc/letsencrypt/privkey-copy.pem
+    cp /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem /etc/letsencrypt/fullchain-copy.pem
+    nginx -s reload
+
+else
+    if [ -e /etc/letsencrypt/live/${SERVERNAME:-example.com}/fullchain.pem ]; then
+        BIGSLEEP="$(( 360 + $(($RANDOM % 360)) ))"m # 6-12 hours 
+        sleep $BIGSLEEP
+    fi
+fi
+
+SMALLSLEEP="$(( 150 + $(($RANDOM % 300)) ))"s # 2.5-7.5 minutes 
+sleep $SMALLSLEEP
